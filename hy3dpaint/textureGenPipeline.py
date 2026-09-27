@@ -13,6 +13,7 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 import os
+import gc
 import torch
 import copy
 import trimesh
@@ -37,6 +38,8 @@ diffusers_logging.set_verbosity(50)
 class Hunyuan3DPaintConfig:
     def __init__(self, max_num_view, resolution):
         self.device = "cuda"
+        self.runtime_device = "cuda"
+        self.low_vram_mode = False
 
         self.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
         self.custom_pipeline = "hunyuanpaintpbr"
@@ -79,9 +82,23 @@ class Hunyuan3DPaintPipeline:
             texture_size=self.config.texture_size,
             bake_mode=self.config.bake_mode,
             raster_mode=self.config.raster_mode,
+            device=self.config.device,
         )
         self.view_processor = ViewProcessor(self.config, self.render)
         self.load_models()
+
+    def move_render_to(self, device):
+        for name, value in vars(self.render).items():
+            if torch.is_tensor(value):
+                setattr(self.render, name, value.to(device))
+        self.render.device = str(device)
+
+    def to(self, device):
+        for model in self.models.values():
+            model.to(device)
+        self.move_render_to(device)
+        self.config.device = str(device)
+        return self
 
     def load_models(self):
         torch.cuda.empty_cache()
@@ -92,6 +109,10 @@ class Hunyuan3DPaintPipeline:
     @torch.no_grad()
     def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
         """Generate texture for 3D mesh using multiview diffusion"""
+        low_vram_mode = getattr(self.config, "low_vram_mode", False)
+        runtime_device = getattr(self.config, "runtime_device", self.config.device)
+        if low_vram_mode:
+            self.move_render_to(runtime_device)
         # Ensure image_prompt is a list
         if isinstance(image_path, str):
             image_prompt = Image.open(image_path)
@@ -145,21 +166,41 @@ class Hunyuan3DPaintPipeline:
         image_style = [image.convert("RGB") for image in image_style]
 
         ###########  Multiview  ##########
-        multiviews_pbr = self.models["multiview_model"](
-            image_style,
-            normal_maps + position_maps,
-            prompt=image_caption,
-            custom_view_size=self.config.resolution,
-            resize_input=True,
-        )
+        multiview_model = self.models["multiview_model"]
+        if low_vram_mode:
+            multiview_model.to(runtime_device)
+        try:
+            multiviews_pbr = multiview_model(
+                image_style,
+                normal_maps + position_maps,
+                prompt=image_caption,
+                custom_view_size=self.config.resolution,
+                resize_input=True,
+            )
+        finally:
+            if low_vram_mode:
+                multiview_model.to("cpu")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         ###########  Enhance  ##########
         enhance_images = {}
         enhance_images["albedo"] = copy.deepcopy(multiviews_pbr["albedo"])
         enhance_images["mr"] = copy.deepcopy(multiviews_pbr["mr"])
 
-        for i in range(len(enhance_images["albedo"])):
-            enhance_images["albedo"][i] = self.models["super_model"](enhance_images["albedo"][i])
-            enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
+        super_model = self.models["super_model"]
+        if low_vram_mode:
+            super_model.to(runtime_device)
+        try:
+            for i in range(len(enhance_images["albedo"])):
+                enhance_images["albedo"][i] = super_model(enhance_images["albedo"][i])
+                enhance_images["mr"][i] = super_model(enhance_images["mr"][i])
+        finally:
+            if low_vram_mode:
+                super_model.to("cpu")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         ###########  Bake  ##########
         for i in range(len(enhance_images)):

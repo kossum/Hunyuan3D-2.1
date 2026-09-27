@@ -33,6 +33,9 @@ import random
 import shutil
 import subprocess
 import time
+import gc
+from functools import wraps
+from threading import Lock
 from glob import glob
 from pathlib import Path
 
@@ -83,6 +86,14 @@ else:
                 self.duration = duration
             def __call__(self, func):
                 return func 
+
+_generation_lock = Lock()
+def _serialized_generation(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with _generation_lock:
+            return func(*args, **kwargs)
+    return wrapped
 
 def get_example_img_list():
     """
@@ -322,6 +333,30 @@ def _gen_shape(
     main_image = image if not MV_MODE else image['front']
     return mesh, main_image, save_folder, stats, seed
 
+def _generate_shape_with_offload(*positional_args, **kwargs):
+    """Run shape inference with its weights on the selected device only during this stage."""
+    if args.low_vram_mode:
+        i23d_worker.to(args.device)
+    try:
+        return _gen_shape(*positional_args, **kwargs)
+    finally:
+        if args.low_vram_mode:
+            i23d_worker.to("cpu")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+def _generate_texture_with_offload(**kwargs):
+    try:
+        return tex_pipeline(**kwargs)
+    finally:
+        if args.low_vram_mode:
+            tex_pipeline.to("cpu")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+@_serialized_generation
 @spaces.GPU(duration=60)
 def generation_all(
     caption=None,
@@ -339,7 +374,7 @@ def generation_all(
     randomize_seed: bool = False,
 ):
     start_time_0 = time.time()
-    mesh, image, save_folder, stats, seed = _gen_shape(
+    mesh, image, save_folder, stats, seed = _generate_shape_with_offload(
         caption,
         image,
         mv_image_front=mv_image_front,
@@ -378,7 +413,7 @@ def generation_all(
     tmp_time = time.time()
 
     text_path = os.path.join(save_folder, f'textured_mesh.obj')
-    path_textured = tex_pipeline(mesh_path=path, image_path=image, output_mesh_path=text_path, save_glb=False)
+    path_textured = _generate_texture_with_offload(mesh_path=path, image_path=image, output_mesh_path=text_path, save_glb=False)
         
     logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['texture generation'] = time.time() - tmp_time
@@ -404,6 +439,7 @@ def generation_all(
         seed,
     )
 
+@_serialized_generation
 @spaces.GPU(duration=60)
 def shape_generation(
     caption=None,
@@ -421,7 +457,7 @@ def shape_generation(
     randomize_seed: bool = False,
 ):
     start_time_0 = time.time()
-    mesh, image, save_folder, stats, seed = _gen_shape(
+    mesh, image, save_folder, stats, seed = _generate_shape_with_offload(
         caption,
         image,
         mv_image_front=mv_image_front,
@@ -797,6 +833,10 @@ if __name__ == '__main__':
 
             from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
             conf = Hunyuan3DPaintConfig(max_num_view=8, resolution=768)
+            conf.low_vram_mode = args.low_vram_mode
+            conf.runtime_device = args.device
+            if args.low_vram_mode:
+                conf.device = "cpu"
             conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
             conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
             conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
@@ -836,7 +876,7 @@ if __name__ == '__main__':
         args.model_path,
         subfolder=args.subfolder,
         use_safetensors=False,
-        device=args.device,
+        device="cpu" if args.low_vram_mode else args.device,
     )
     if args.enable_flashvdm:
         mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo

@@ -57,6 +57,13 @@ class multiviewDiffusionNet:
             self.dino_v2 = Dino_v2(config.dino_ckpt_path).to(torch.float16)
             self.dino_v2 = self.dino_v2.to(self.device)
 
+    def to(self, device):
+        self.device = str(device)
+        self.pipeline.to(device)
+        if hasattr(self, "dino_v2"):
+            self.dino_v2.to(device)
+        return self
+
     def seed_everything(self, seed):
         random.seed(seed)
         np.random.seed(seed)

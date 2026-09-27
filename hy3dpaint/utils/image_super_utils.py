@@ -13,6 +13,7 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 import numpy as np
+import torch
 from PIL import Image
 
 
@@ -32,8 +33,17 @@ class imageSuperNet:
             pre_pad=0,
             half=True,
             gpu_id=None,
+            device=config.device,
         )
         self.upsampler = upsampler
+
+    def to(self, device):
+        self.upsampler.model.to(device)
+        self.upsampler.device = torch.device(device)
+        for name in ("img", "output"):
+            if hasattr(self.upsampler, name):
+                setattr(self.upsampler, name, None)
+        return self
 
     def __call__(self, image):
         output, _ = self.upsampler.enhance(np.array(image))
